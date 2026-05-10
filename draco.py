@@ -11,9 +11,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import platform
 import shutil
 
-import readline  # noqa: F401  — enables arrow-key history in input()
+try:
+    import readline  # noqa: F401  — arrow-key history; Linux/Mac only
+except ImportError:
+    pass  # not available on Windows — that's fine
 
 try:
     import requests
@@ -24,14 +28,19 @@ except ImportError:
     import requests
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-P  = '\033[95m'   # purple
-C  = '\033[96m'   # cyan
-G  = '\033[92m'   # green
-Y  = '\033[93m'   # yellow
-R  = '\033[91m'   # red
-B  = '\033[1m'    # bold
-D  = '\033[2m'    # dim
-X  = '\033[0m'    # reset
+# Enable VT/ANSI on Windows 10+; fall back to no colour on older terminals.
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7)
+        P='\033[95m'; C='\033[96m'; G='\033[92m'; Y='\033[93m'; R='\033[91m'
+        B='\033[1m';  D='\033[2m';  X='\033[0m'
+    except Exception:
+        P=C=G=Y=R=B=D=X=''
+else:
+    P='\033[95m'; C='\033[96m'; G='\033[92m'; Y='\033[93m'; R='\033[91m'
+    B='\033[1m';  D='\033[2m';  X='\033[0m'
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 OLLAMA_BASE    = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
@@ -355,13 +364,16 @@ def _model_size_hint(name: str) -> str:
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are Draco, a powerful AI agent running directly on the user's Linux machine.
+You are Draco, a powerful AI agent running directly on the user's machine.
 You have full tool access: run any shell command, read/write any file, list directories.
+OS: {os}
+Shell: {shell}
 Current working directory: {cwd}
 Home directory: {home}
 Hostname: {hostname}
 
 Be direct. Use tools to get real information instead of guessing.
+Use commands appropriate for the user's OS (e.g. PowerShell/cmd on Windows, bash on Linux/Mac).
 Chain tool calls to finish tasks. For destructive actions, say what you're doing first."""
 
 TOOLS = [
@@ -440,7 +452,7 @@ def execute_tool(name, args, cwd):
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True,
                 cwd=wd, timeout=120,
-                env={**os.environ, 'HOME': str(Path.home())}
+                env={**os.environ, 'HOME': str(Path.home())} if sys.platform != 'win32' else None
             )
             out = result.stdout
             err = result.stderr
@@ -788,7 +800,12 @@ examples:
     print(f'{D}  Docker  : {X}{docker_labels.get(docker_status, docker_status)}')
     print(f'{D}  /help  /models  /pull  /backend  /credentials  /docker  /exit{X}\n')
 
-    system   = SYSTEM_PROMPT.format(cwd=cwd, home=str(Path.home()), hostname=os.uname().nodename)
+    _os    = platform.system()   # 'Windows', 'Linux', 'Darwin'
+    _shell = 'PowerShell/cmd' if _os == 'Windows' else os.environ.get('SHELL', 'bash')
+    system = SYSTEM_PROMPT.format(
+        os=_os, shell=_shell,
+        cwd=cwd, home=str(Path.home()), hostname=platform.node()
+    )
     messages = [{'role': 'system', 'content': system}]
 
     # ── Single prompt mode ────────────────────────────────────────────────────

@@ -4,20 +4,34 @@ A local AI agent for your terminal — runs on your machine, talks to your files
 
 ## Install
 
-One-liner:
+### Windows
+
+Open PowerShell and run:
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/cczerp/draco/main/install.ps1 | iex"
+```
+
+Then open a **new** terminal and type `draco`.
+
+### Linux / macOS
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cczerp/draco/main/install.sh | bash
 ```
 
-Or clone and run:
-```bash
-git clone https://github.com/cczerp/draco
-bash draco/install.sh
-```
-
 No sudo? Use `--user` to install to `~/.local/bin`:
 ```bash
-bash draco/install.sh --user
+curl -fsSL https://raw.githubusercontent.com/cczerp/draco/main/install.sh | bash -s -- --user
+```
+
+### Manual (any OS)
+
+```bash
+git clone https://github.com/cczerp/draco
+# Windows:
+powershell -ExecutionPolicy Bypass -File draco\install.ps1
+# Linux/Mac:
+bash draco/install.sh
 ```
 
 **Requirements:** Python 3.8+, internet connection for first-time model download.  
