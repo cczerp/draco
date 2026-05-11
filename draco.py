@@ -45,8 +45,13 @@ else:
 # ── Constants ─────────────────────────────────────────────────────────────────
 OLLAMA_BASE    = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
 NEBIUS_BASE    = 'https://api.studio.nebius.ai/v1'
-DEFAULT_MODEL  = os.environ.get('DRACO_MODEL', 'qwen3.5:2b')
-FALLBACK_MODEL = 'qwen3.5:2b'   # auto-pulled when Ollama has nothing installed
+DEFAULT_MODEL  = os.environ.get('DRACO_MODEL', 'qwen2.5-coder:7b')
+FALLBACK_MODEL = 'qwen2.5-coder:7b'   # auto-pulled when Ollama has nothing installed
+
+MODEL_ALIASES = {
+    'coder': 'qwen2.5-coder:7b',
+    'dolph': 'dolphin3:8b',
+}
 CONFIG_FILE    = Path.home() / '.config' / 'draco' / 'config.json'
 
 # ── Runtime state — set by setup() or /backend ───────────────────────────────
@@ -172,9 +177,10 @@ def activate_nebius(api_key: str, models: list):
 
 def pick_model(requested: str, available: list) -> str:
     """Return best match for requested model name from available list."""
-    if requested and requested in available:
-        return requested
-    base = (requested or FALLBACK_MODEL).split(':')[0]
+    resolved = MODEL_ALIASES.get(requested, requested) if requested else requested
+    if resolved and resolved in available:
+        return resolved
+    base = (resolved or FALLBACK_MODEL).split(':')[0]
     alts = [m for m in available if m.split('/')[-1].lower().startswith(base.lower())]
     return alts[0] if alts else available[0]
 
@@ -524,6 +530,15 @@ def call_llm(messages, model, use_tools):
             _chat_url, headers=_headers,
             json=payload, stream=True, timeout=180
         )
+        if resp.status_code == 400 and use_tools:
+            print(f'\n{Y}  Model doesn\'t support tool use — retrying without tools.{X}')
+            print(f'{D}  Pull a tool-capable model: /pull qwen2.5-coder:7b{X}\n')
+            payload.pop('tools', None)
+            payload.pop('tool_choice', None)
+            resp = requests.post(
+                _chat_url, headers=_headers,
+                json=payload, stream=True, timeout=180
+            )
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
         print(f'\n{R}Cannot connect to {_backend} backend.{X}')
@@ -765,7 +780,18 @@ examples:
     ap.add_argument('--dangerously-skip-permissions', action='store_true',
                     help='Auto-approve all tool calls without prompting')
     ap.add_argument('--no-tools', action='store_true', help='Disable tool use')
+    ap.add_argument('--models', action='store_true', help='List available models and exit')
     args = ap.parse_args()
+
+    if args.models:
+        models = get_ollama_models()
+        if models is None:
+            print(f'{R}  Ollama unreachable{X}')
+            sys.exit(1)
+        for m in models:
+            marker = f' {G}← default{X}' if m.startswith('qwen2.5-coder:7b') else ''
+            print(f'  {m}{marker}')
+        sys.exit(0)
 
     skip      = args.dangerously_skip_permissions
     use_tools = not args.no_tools
@@ -849,10 +875,11 @@ examples:
 
             elif cmd == '/model':
                 if len(parts) > 1:
-                    model = parts[1]
+                    model = MODEL_ALIASES.get(parts[1], parts[1])
                     print(f'{G}✓ Model → {model}{X}')
                 else:
                     print(f'  Current: {B}{model}{X}  (backend: {_backend})')
+                    print(f'{D}  Aliases: ' + '  '.join(f'{k}={v}' for k, v in MODEL_ALIASES.items()) + X)
 
             elif cmd == '/models':
                 backend_label = 'Nebius' if _backend == 'nebius' else 'Ollama'
