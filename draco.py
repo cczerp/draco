@@ -378,7 +378,7 @@ Current working directory: {cwd}
 Home directory: {home}
 Hostname: {hostname}
 
-Be direct. Use tools to get real information instead of guessing.
+Be direct. Only use tools when you actually need live system information — for simple questions, answer directly without calling any tools.
 Use commands appropriate for the user's OS (e.g. PowerShell/cmd on Windows, bash on Linux/Mac).
 Chain tool calls to finish tasks. For destructive actions, say what you're doing first."""
 
@@ -507,38 +507,40 @@ def _resolve(path, cwd):
     return path if os.path.isabs(path) else os.path.join(cwd, path)
 
 
-# ── LLM call with streaming ───────────────────────────────────────────────────
+# ── LLM call ─────────────────────────────────────────────────────────────────
 
 def call_llm(messages, model, use_tools):
     """
-    Stream a response from the active backend.
+    Call the active backend. Streams text when no tools; non-streaming when
+    tools are active (Ollama streaming + tool calls is unreliable).
     Returns (content: str, tool_calls: list).
-    Text is printed to stdout as it streams.
     """
     payload = {
         'model': model,
         'messages': messages,
-        'stream': True,
         'temperature': 0.7,
+        'stream': not use_tools,
     }
     if use_tools:
         payload['tools']       = TOOLS
         payload['tool_choice'] = 'auto'
 
-    try:
-        resp = requests.post(
+    def _post(p):
+        return requests.post(
             _chat_url, headers=_headers,
-            json=payload, stream=True, timeout=180
+            json=p, stream=p.get('stream', False), timeout=180
         )
+
+    try:
+        resp = _post(payload)
         if resp.status_code == 400 and use_tools:
             print(f'\n{Y}  Model doesn\'t support tool use — retrying without tools.{X}')
             print(f'{D}  Pull a tool-capable model: /pull qwen2.5-coder:7b{X}\n')
             payload.pop('tools', None)
             payload.pop('tool_choice', None)
-            resp = requests.post(
-                _chat_url, headers=_headers,
-                json=payload, stream=True, timeout=180
-            )
+            payload['stream'] = True
+            resp = _post(payload)
+            use_tools = False
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
         print(f'\n{R}Cannot connect to {_backend} backend.{X}')
@@ -549,8 +551,29 @@ def call_llm(messages, model, use_tools):
         print(f'\n{R}Error: {e}{X}\n')
         return None, []
 
+    # ── Non-streaming (tool-use) path ─────────────────────────────────────────
+    if not payload.get('stream'):
+        data       = resp.json()
+        message    = data.get('choices', [{}])[0].get('message', {})
+        content    = message.get('content') or ''
+        raw_calls  = message.get('tool_calls') or []
+        if content:
+            print(f'\n{P}{B}Draco:{X} {content}\n')
+        tool_calls = [
+            {
+                'id': tc.get('id', f'call_{i}'),
+                'function': {
+                    'name': tc['function']['name'],
+                    'arguments': tc['function'].get('arguments', '{}'),
+                }
+            }
+            for i, tc in enumerate(raw_calls)
+            if tc.get('function', {}).get('name')
+        ]
+        return content, tool_calls
+
+    # ── Streaming (no-tools) path ─────────────────────────────────────────────
     content        = ''
-    tc_map         = {}
     printed_header = False
 
     for raw in resp.iter_lines():
@@ -566,9 +589,7 @@ def call_llm(messages, model, use_tools):
         except json.JSONDecodeError:
             continue
 
-        delta = chunk.get('choices', [{}])[0].get('delta', {})
-
-        tok = delta.get('content') or ''
+        tok = chunk.get('choices', [{}])[0].get('delta', {}).get('content') or ''
         if tok:
             if not printed_header:
                 print(f'\n{P}{B}Draco:{X} ', end='', flush=True)
@@ -576,27 +597,10 @@ def call_llm(messages, model, use_tools):
             print(tok, end='', flush=True)
             content += tok
 
-        for tc in delta.get('tool_calls', []):
-            idx = tc.get('index', 0)
-            if idx not in tc_map:
-                tc_map[idx] = {'id': '', 'name': '', 'arguments': ''}
-            if tc.get('id'):
-                tc_map[idx]['id'] = tc['id']
-            fn = tc.get('function', {})
-            if fn.get('name'):
-                tc_map[idx]['name'] += fn['name']
-            if fn.get('arguments'):
-                tc_map[idx]['arguments'] += fn['arguments']
-
     if printed_header:
         print('\n')
 
-    tool_calls = [
-        {'id': v['id'], 'function': {'name': v['name'], 'arguments': v['arguments']}}
-        for _, v in sorted(tc_map.items())
-        if v['name']
-    ]
-    return content, tool_calls
+    return content, []
 
 
 # ── Permission prompt ─────────────────────────────────────────────────────────
