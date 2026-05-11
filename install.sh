@@ -10,7 +10,11 @@
 set -e
 
 USER_INSTALL=false
-[[ "$1" == "--user" ]] && USER_INSTALL=true
+UPDATE=false
+for arg in "$@"; do
+    [[ "$arg" == "--user" ]]   && USER_INSTALL=true
+    [[ "$arg" == "--update" ]] && UPDATE=true
+done
 
 P='\033[95m'; G='\033[92m'; Y='\033[93m'; R='\033[91m'
 B='\033[1m';  D='\033[2m';  X='\033[0m'
@@ -25,9 +29,18 @@ echo ""
 
 # ── Locate or download draco.py ───────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-/tmp}")" 2>/dev/null && pwd || echo /tmp)"
-DRACO_SRC="$SCRIPT_DIR/draco.py"
 
-if [[ ! -f "$DRACO_SRC" ]]; then
+if [[ "$UPDATE" == true ]]; then
+    echo -e "${D}  --update: fetching latest draco.py from GitHub…${X}"
+    DRACO_SRC="/tmp/draco_update.py"
+    if ! curl -fsSL "$RAW_URL" -o "$DRACO_SRC"; then
+        echo -e "${R}  Download failed. Check your internet connection.${X}"
+        exit 1
+    fi
+    echo -e "  ${G}✓${X} downloaded"
+elif [[ -f "$SCRIPT_DIR/draco.py" ]]; then
+    DRACO_SRC="$SCRIPT_DIR/draco.py"
+else
     echo -e "${D}  Downloading draco.py from GitHub…${X}"
     DRACO_SRC="/tmp/draco.py"
     if ! curl -fsSL "$RAW_URL" -o "$DRACO_SRC"; then
@@ -106,7 +119,12 @@ echo -e "    draco                                 # interactive session"
 echo -e "    draco 'what files are on my desktop?' # one-shot prompt"
 echo -e "    draco --dangerously-skip-permissions  # auto-approve all tools"
 echo -e "    draco --model <name>                  # pick a model"
+echo -e "    draco --models                        # list installed models"
 echo -e "    /models                               # list installed models (inside draco)"
 echo -e "    /docker                               # set up Docker (inside draco)"
-echo -e "    /credentials                          # add Nebius API key (inside draco)${X}"
+echo -e "    /credentials                          # add Nebius API key (inside draco)"
+echo ""
+echo -e "  To update draco later:"
+echo -e "    bash install.sh --update              # pull latest from GitHub"
+echo -e "    bash install.sh                       # reinstall from local clone${X}"
 echo ""
