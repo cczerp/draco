@@ -7,6 +7,7 @@ Usage: draco [--dangerously-skip-permissions] [--model MODEL] [prompt]
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +29,6 @@ except ImportError:
     import requests
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-# Enable VT/ANSI on Windows 10+; fall back to no colour on older terminals.
 if sys.platform == 'win32':
     try:
         import ctypes
@@ -46,19 +46,19 @@ else:
 OLLAMA_BASE    = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
 NEBIUS_BASE    = 'https://api.studio.nebius.ai/v1'
 DEFAULT_MODEL  = os.environ.get('DRACO_MODEL', 'qwen2.5-coder:7b')
-FALLBACK_MODEL = 'qwen2.5-coder:7b'   # auto-pulled when Ollama has nothing installed
+FALLBACK_MODEL = 'qwen2.5-coder:7b'
 
 MODEL_ALIASES = {
     'coder': 'qwen2.5-coder:7b',
-    'dolph': 'dolphin3:8b',
+    'dolph': 'tinydolphin:latest',
 }
-CONFIG_FILE    = Path.home() / '.config' / 'draco' / 'config.json'
+CONFIG_FILE = Path.home() / '.config' / 'draco' / 'config.json'
 
-# ── Runtime state — set by setup() or /backend ───────────────────────────────
+# ── Runtime state ─────────────────────────────────────────────────────────────
 _chat_url = OLLAMA_BASE.rstrip('/') + '/v1/chat/completions'
 _headers  = {}
 _backend  = 'ollama'
-_models   = []   # names available on the active backend
+_models   = []
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -79,7 +79,6 @@ def save_config(cfg: dict):
 # ── Ollama helpers ────────────────────────────────────────────────────────────
 
 def get_ollama_models() -> list | None:
-    """Return installed model names, or None if Ollama is unreachable."""
     try:
         r = requests.get(f'{OLLAMA_BASE}/api/tags', timeout=4)
         if r.ok:
@@ -89,7 +88,6 @@ def get_ollama_models() -> list | None:
     return None
 
 def pull_model(model_name: str) -> bool:
-    """Stream pull progress from Ollama. Returns True on success."""
     print(f'\n{C}  Downloading {B}{model_name}{X}{C} …{X}')
     print(f'{D}  (this may take several minutes — you can Ctrl+C to cancel){X}\n')
     try:
@@ -142,7 +140,6 @@ def get_nebius_models(api_key: str) -> list:
     return []
 
 def prompt_nebius_credentials() -> str | None:
-    """Interactively ask for Nebius API key, save it, return it (or None)."""
     print(f'\n{P}{B}  Nebius API Setup{X}')
     print(f'{D}  Get your key at: https://studio.nebius.ai/ → API Keys{X}\n')
     try:
@@ -176,19 +173,21 @@ def activate_nebius(api_key: str, models: list):
     _models   = models
 
 def pick_model(requested: str, available: list) -> str:
-    """Return best match for requested model name from available list."""
     resolved = MODEL_ALIASES.get(requested, requested) if requested else requested
     if resolved and resolved in available:
         return resolved
     base = (resolved or FALLBACK_MODEL).split(':')[0]
     alts = [m for m in available if m.split('/')[-1].lower().startswith(base.lower())]
-    return alts[0] if alts else available[0]
+    chosen = alts[0] if alts else available[0]
+    if resolved and chosen != resolved:
+        print(f'{Y}  Model "{resolved}" not found — using {chosen} instead.{X}')
+        print(f'{D}  To get it: /pull {resolved}{X}\n')
+    return chosen
 
 
 # ── Docker helpers ────────────────────────────────────────────────────────────
 
 def check_docker() -> str:
-    """Returns 'ok', 'not_running', 'no_permission', or 'not_installed'."""
     if not shutil.which('docker'):
         return 'not_installed'
     try:
@@ -203,7 +202,6 @@ def check_docker() -> str:
         return 'not_running'
 
 def run_docker_setup():
-    """Interactive Docker setup walkthrough — installs, groups, starts daemon."""
     status = check_docker()
 
     if status == 'ok':
@@ -212,7 +210,6 @@ def run_docker_setup():
 
     print(f'\n{P}{B}  Docker Setup{X}\n')
 
-    # ── Step 1: install ───────────────────────────────────────────────────────
     if status == 'not_installed':
         print(f'  Docker is not installed.\n')
         print(f'  {B}Step 1{X} — Install Docker via the official script:')
@@ -230,12 +227,11 @@ def run_docker_setup():
                 print(f'  curl -fsSL https://get.docker.com | sh\n')
                 return
             print(f'\n{G}  ✓ Docker installed.{X}\n')
-            status = 'no_permission'   # newly installed → not in group yet
+            status = 'no_permission'
         else:
             print(f'{D}  Skipping.{X}\n')
             return
 
-    # ── Step 2: add user to docker group ─────────────────────────────────────
     if status == 'no_permission':
         user = os.environ.get('USER', 'paul')
         print(f'  {B}Step 2{X} — Add {user} to the docker group:')
@@ -254,7 +250,6 @@ def run_docker_setup():
                 print(f'{R}  Failed.{X} Run manually: sudo usermod -aG docker {user}\n')
         return
 
-    # ── Step 3: start daemon ──────────────────────────────────────────────────
     if status == 'not_running':
         print(f'  Docker is installed but the daemon is not running.\n')
         print(f'  {B}Step 3{X} — Start Docker and enable it on boot:')
@@ -272,14 +267,9 @@ def run_docker_setup():
                 print(f'{R}  Failed.{X} Try: sudo systemctl start docker\n')
 
 
-# ── Startup: detect backends, ensure a model is ready ────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 def setup(requested_model: str) -> str:
-    """
-    Probe Ollama then Nebius. Ensure at least one model is available.
-    Mutates _chat_url / _headers / _backend / _models globals.
-    Returns the model name to use.
-    """
     cfg = load_config()
 
     # ── Try Ollama ────────────────────────────────────────────────────────────
@@ -290,7 +280,6 @@ def setup(requested_model: str) -> str:
             activate_ollama(ollama_models)
             return pick_model(requested_model, ollama_models)
 
-        # Ollama is up but empty — ask to pull a starter model
         pull_name = requested_model or FALLBACK_MODEL
         size_hint = _model_size_hint(pull_name)
         print(f'\n{Y}  Ollama is running but no models are installed.{X}')
@@ -310,7 +299,7 @@ def setup(requested_model: str) -> str:
     else:
         print(f'{Y}  Ollama not found at {OLLAMA_BASE}.{X}\n')
 
-    # ── Try Nebius (env var beats saved config) ───────────────────────────────
+    # ── Try Nebius ────────────────────────────────────────────────────────────
     nebius_key = os.environ.get('NEBIUS_API_KEY') or cfg.get('nebius_api_key')
     if nebius_key:
         print(f'{D}  Checking Nebius cloud…{X}')
@@ -322,7 +311,7 @@ def setup(requested_model: str) -> str:
             return chosen
         print(f'{R}  Nebius key found but could not fetch models (bad key?).{X}\n')
 
-    # ── Nothing available — offer setup options ───────────────────────────────
+    # ── Nothing available ─────────────────────────────────────────────────────
     print(f'  {B}No AI backend detected. Choose an option:{X}\n')
     print(f'  {C}1{X}  Install Ollama  (local, private, free — runs on your machine)')
     print(f'  {C}2{X}  Add Nebius API key  (cloud inference, pay-per-use)')
@@ -371,6 +360,7 @@ def _model_size_hint(name: str) -> str:
 
 SYSTEM_PROMPT = """\
 You are Draco, a powerful AI agent running directly on the user's machine.
+Your name is Draco. You are not ChatGPT, not GPT-4, not Claude — you are Draco.
 You have full tool access: run any shell command, read/write any file, list directories.
 OS: {os}
 Shell: {shell}
@@ -378,9 +368,12 @@ Current working directory: {cwd}
 Home directory: {home}
 Hostname: {hostname}
 
-Be direct. Only use tools when you actually need live system information — for simple questions, answer directly without calling any tools.
-Use commands appropriate for the user's OS (e.g. PowerShell/cmd on Windows, bash on Linux/Mac).
-Chain tool calls to finish tasks. For destructive actions, say what you're doing first."""
+Rules:
+- Be direct and action-oriented. When a task requires system access, use your tools immediately — don't describe what you would do, just do it.
+- For simple factual questions, answer directly without calling tools.
+- Chain multiple tool calls to complete tasks end-to-end.
+- For destructive actions (deleting files, etc.), briefly state what you're about to do before doing it.
+- Use shell commands appropriate for the user's OS."""
 
 TOOLS = [
     {
@@ -446,11 +439,12 @@ TOOL_ICONS = {
     'list_directory': '📁',
 }
 
+_KNOWN_TOOLS = {t['function']['name'] for t in TOOLS}
+
 
 # ── Tool execution ────────────────────────────────────────────────────────────
 
 def execute_tool(name, args, cwd):
-    """Run a tool and return (result_string, is_error)."""
     try:
         if name == 'run_command':
             cmd = args.get('command', '')
@@ -507,6 +501,60 @@ def _resolve(path, cwd):
     return path if os.path.isabs(path) else os.path.join(cwd, path)
 
 
+# ── JSON tool-call fallback ───────────────────────────────────────────────────
+# Some local models output tool calls as JSON in code fences rather than using
+# the structured API. This parser catches those and executes them anyway.
+
+def _extract_text_tool_calls(content: str) -> list:
+    calls = []
+    seen  = set()
+    dec   = json.JSONDecoder()
+
+    def _try_add(obj):
+        name = obj.get('name')
+        if name not in _KNOWN_TOOLS:
+            return
+        args = obj.get('arguments') or obj.get('parameters') or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        calls.append({
+            'id': f'text_call_{len(calls)}',
+            'function': {'name': name, 'arguments': json.dumps(args)},
+        })
+
+    # Fenced code blocks first
+    for block in re.findall(r'```(?:json)?\s*([\s\S]*?)```', content):
+        block = block.strip()
+        if not block or block in seen:
+            continue
+        seen.add(block)
+        try:
+            _try_add(json.loads(block))
+        except Exception:
+            pass
+
+    # Scan for bare JSON objects anywhere in the text
+    i = 0
+    while i < len(content):
+        if content[i] == '{':
+            try:
+                obj, end = dec.raw_decode(content, i)
+                raw = content[i:end]
+                if raw not in seen:
+                    seen.add(raw)
+                    _try_add(obj)
+                i = end
+                continue
+            except json.JSONDecodeError:
+                pass
+        i += 1
+
+    return calls
+
+
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
 def call_llm(messages, model, use_tools):
@@ -516,10 +564,10 @@ def call_llm(messages, model, use_tools):
     Returns (content: str, tool_calls: list).
     """
     payload = {
-        'model': model,
-        'messages': messages,
+        'model':       model,
+        'messages':    messages,
         'temperature': 0.7,
-        'stream': not use_tools,
+        'stream':      not use_tools,
     }
     if use_tools:
         payload['tools']       = TOOLS
@@ -539,7 +587,7 @@ def call_llm(messages, model, use_tools):
             payload.pop('tools', None)
             payload.pop('tool_choice', None)
             payload['stream'] = True
-            resp = _post(payload)
+            resp      = _post(payload)
             use_tools = False
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
@@ -553,17 +601,17 @@ def call_llm(messages, model, use_tools):
 
     # ── Non-streaming (tool-use) path ─────────────────────────────────────────
     if not payload.get('stream'):
-        data       = resp.json()
-        message    = data.get('choices', [{}])[0].get('message', {})
-        content    = message.get('content') or ''
-        raw_calls  = message.get('tool_calls') or []
+        data      = resp.json()
+        message   = data.get('choices', [{}])[0].get('message', {})
+        content   = message.get('content') or ''
+        raw_calls = message.get('tool_calls') or []
         if content:
             print(f'\n{P}{B}Draco:{X} {content}\n')
         tool_calls = [
             {
                 'id': tc.get('id', f'call_{i}'),
                 'function': {
-                    'name': tc['function']['name'],
+                    'name':      tc['function']['name'],
                     'arguments': tc['function'].get('arguments', '{}'),
                 }
             }
@@ -652,6 +700,13 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
         if content is None:
             return
 
+        # Fallback: if the model printed tool calls as JSON text instead of
+        # using the structured API, parse and execute them.
+        if not tool_calls and content and use_tools:
+            tool_calls = _extract_text_tool_calls(content)
+            if tool_calls:
+                print(f'{D}  (parsed {len(tool_calls)} tool call(s) from response text){X}')
+
         if not tool_calls:
             if content:
                 messages.append({'role': 'assistant', 'content': content})
@@ -676,10 +731,10 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
                 result, is_error = execute_tool(name, args, cwd)
                 print_result(result, is_error)
             messages.append({
-                'role': 'tool',
+                'role':         'tool',
                 'tool_call_id': tc['id'],
-                'name': name,
-                'content': result
+                'name':         name,
+                'content':      result
             })
 
     print(f'{Y}  Max steps reached.{X}')
@@ -700,7 +755,6 @@ def cmd_models():
             print(f'  {m}')
 
 def cmd_backend_switch(target: str, requested_model: str) -> str:
-    """Switch to ollama or nebius, return new model name."""
     global _models
     cfg = load_config()
     if target == 'ollama':
@@ -801,15 +855,12 @@ examples:
     use_tools = not args.no_tools
     cwd       = os.getcwd()
 
-    # ── Banner ────────────────────────────────────────────────────────────────
     print(f'\n{P}{B}  ╔═══════════════════════════════╗')
     print(f'  ║  🐉  Draco  ·  local AI agent  ║')
     print(f'  ╚═══════════════════════════════╝{X}')
 
-    # ── Detect backends, ensure a model is ready ──────────────────────────────
     model = setup(args.model)
 
-    # ── Post-setup banner lines ───────────────────────────────────────────────
     backend_label = f'{C}☁  Nebius{X}' if _backend == 'nebius' else f'{G}⬡  Ollama (local){X}'
     print(f'{D}  Backend : {X}{backend_label}')
     print(f'{D}  Model   : {model}')
@@ -819,18 +870,17 @@ examples:
     else:
         print(f'{D}  Tools   : confirm each call   (skip with --dangerously-skip-permissions){X}')
 
-    # Docker status (non-blocking — just inform, don't block startup)
     docker_status = check_docker()
     docker_labels = {
-        'ok':             f'{G}✓ running{X}',
-        'not_running':    f'{Y}installed but not running{X}  {D}→ /docker to fix{X}',
-        'no_permission':  f'{Y}installed — need group permission{X}  {D}→ /docker to fix{X}',
-        'not_installed':  f'{R}not installed{X}  {D}→ /docker to set up{X}',
+        'ok':            f'{G}✓ running{X}',
+        'not_running':   f'{Y}installed but not running{X}  {D}→ /docker to fix{X}',
+        'no_permission': f'{Y}installed — need group permission{X}  {D}→ /docker to fix{X}',
+        'not_installed': f'{R}not installed{X}  {D}→ /docker to set up{X}',
     }
     print(f'{D}  Docker  : {X}{docker_labels.get(docker_status, docker_status)}')
     print(f'{D}  /help  /models  /pull  /backend  /credentials  /docker  /exit{X}\n')
 
-    _os    = platform.system()   # 'Windows', 'Linux', 'Darwin'
+    _os    = platform.system()
     _shell = 'PowerShell/cmd' if _os == 'Windows' else os.environ.get('SHELL', 'bash')
     system = SYSTEM_PROMPT.format(
         os=_os, shell=_shell,
@@ -838,7 +888,6 @@ examples:
     )
     messages = [{'role': 'system', 'content': system}]
 
-    # ── Single prompt mode ────────────────────────────────────────────────────
     if args.prompt:
         messages.append({'role': 'user', 'content': args.prompt})
         run_turn(messages, model, use_tools, skip, cwd)
@@ -851,7 +900,6 @@ examples:
             run_turn(messages, model, use_tools, skip, cwd)
         return
 
-    # ── Interactive REPL ──────────────────────────────────────────────────────
     while True:
         try:
             user_input = input(f'{P}{B}draco>{X} ').strip()
@@ -909,7 +957,6 @@ examples:
             elif cmd == '/credentials':
                 key = prompt_nebius_credentials()
                 if key and _backend == 'nebius':
-                    # Refresh model list with new key
                     new_models = get_nebius_models(key)
                     if new_models:
                         activate_nebius(key, new_models)
