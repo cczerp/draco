@@ -558,38 +558,35 @@ def _extract_text_tool_calls(content: str) -> list:
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
 def call_llm(messages, model, use_tools):
-    """
-    Call the active backend. Streams text when no tools; non-streaming when
-    tools are active (Ollama streaming + tool calls is unreliable).
-    Returns (content: str, tool_calls: list).
-    """
+    """Call the active backend (always streaming). Returns (content: str, tool_calls: list)."""
     payload = {
         'model':       model,
         'messages':    messages,
         'temperature': 0.7,
-        'stream':      not use_tools,
+        'stream':      True,
     }
     if use_tools:
         payload['tools']       = TOOLS
         payload['tool_choice'] = 'auto'
 
-    def _post(p):
-        return requests.post(
-            _chat_url, headers=_headers,
-            json=p, stream=p.get('stream', False), timeout=180
-        )
+    def _extract_error(r) -> str:
+        try:
+            body = r.json()
+            msg  = body.get('error') or body
+            if isinstance(msg, dict):
+                msg = msg.get('message', str(msg))
+            return str(msg)
+        except Exception:
+            return r.text[:300] or f'HTTP {r.status_code}'
 
     try:
-        resp = _post(payload)
-        if resp.status_code == 400 and use_tools:
-            print(f'\n{Y}  Model doesn\'t support tool use — retrying without tools.{X}')
-            print(f'{D}  Pull a tool-capable model: /pull qwen2.5-coder:7b{X}\n')
-            payload.pop('tools', None)
-            payload.pop('tool_choice', None)
-            payload['stream'] = True
-            resp      = _post(payload)
-            use_tools = False
-        resp.raise_for_status()
+        resp = requests.post(
+            _chat_url, headers=_headers,
+            json=payload, stream=True, timeout=180
+        )
+        if not resp.ok:
+            print(f'\n{R}  {_backend} error {resp.status_code}: {_extract_error(resp)}{X}\n')
+            return None, []
     except requests.exceptions.ConnectionError:
         print(f'\n{R}Cannot connect to {_backend} backend.{X}')
         if _backend == 'ollama':
@@ -599,30 +596,10 @@ def call_llm(messages, model, use_tools):
         print(f'\n{R}Error: {e}{X}\n')
         return None, []
 
-    # ── Non-streaming (tool-use) path ─────────────────────────────────────────
-    if not payload.get('stream'):
-        data      = resp.json()
-        message   = data.get('choices', [{}])[0].get('message', {})
-        content   = message.get('content') or ''
-        raw_calls = message.get('tool_calls') or []
-        if content:
-            print(f'\n{P}{B}Draco:{X} {content}\n')
-        tool_calls = [
-            {
-                'id': tc.get('id', f'call_{i}'),
-                'function': {
-                    'name':      tc['function']['name'],
-                    'arguments': tc['function'].get('arguments', '{}'),
-                }
-            }
-            for i, tc in enumerate(raw_calls)
-            if tc.get('function', {}).get('name')
-        ]
-        return content, tool_calls
-
-    # ── Streaming (no-tools) path ─────────────────────────────────────────────
-    content        = ''
-    printed_header = False
+    # ── Streaming path (handles both plain text and tool-call deltas) ─────────
+    content         = ''
+    printed_header  = False
+    streaming_calls = {}   # index → {id, name, arguments}
 
     for raw in resp.iter_lines():
         if not raw:
@@ -637,7 +614,9 @@ def call_llm(messages, model, use_tools):
         except json.JSONDecodeError:
             continue
 
-        tok = chunk.get('choices', [{}])[0].get('delta', {}).get('content') or ''
+        delta = chunk.get('choices', [{}])[0].get('delta', {})
+
+        tok = delta.get('content') or ''
         if tok:
             if not printed_header:
                 print(f'\n{P}{B}Draco:{X} ', end='', flush=True)
@@ -645,10 +624,35 @@ def call_llm(messages, model, use_tools):
             print(tok, end='', flush=True)
             content += tok
 
+        # Accumulate structured tool-call deltas (OpenAI streaming format)
+        for tc_delta in delta.get('tool_calls') or []:
+            idx = tc_delta.get('index', 0)
+            if idx not in streaming_calls:
+                streaming_calls[idx] = {
+                    'id':        tc_delta.get('id', f'call_{idx}'),
+                    'name':      '',
+                    'arguments': '',
+                }
+            fn = tc_delta.get('function', {})
+            if fn.get('name'):
+                streaming_calls[idx]['name'] += fn['name']
+            streaming_calls[idx]['arguments'] += fn.get('arguments', '')
+
     if printed_header:
         print('\n')
 
-    return content, []
+    tool_calls = [
+        {
+            'id': streaming_calls[k]['id'],
+            'function': {
+                'name':      streaming_calls[k]['name'],
+                'arguments': streaming_calls[k]['arguments'],
+            }
+        }
+        for k in sorted(streaming_calls)
+        if streaming_calls[k]['name']
+    ]
+    return content, tool_calls
 
 
 # ── Permission prompt ─────────────────────────────────────────────────────────
@@ -686,12 +690,15 @@ def print_result(text, is_error):
 # ── One conversation turn ─────────────────────────────────────────────────────
 
 def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
+    # _active_tools may be turned off mid-turn if the model doesn't support
+    # structured tool use (text fallback detected).
+    _active_tools = use_tools
     for step in range(max_steps):
         if step > 0:
             sys.stdout.write(f'{D}  thinking…{X}')
             sys.stdout.flush()
 
-        content, tool_calls = call_llm(messages, model, use_tools)
+        content, tool_calls = call_llm(messages, model, _active_tools)
 
         if step > 0:
             sys.stdout.write('\r' + ' ' * 20 + '\r')
@@ -701,10 +708,15 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
             return
 
         # Fallback: if the model printed tool calls as JSON text instead of
-        # using the structured API, parse and execute them.
+        # using the structured API, parse and execute them. Keep checking on
+        # every step (use the original use_tools flag, not _active_tools) so
+        # models that always output JSON tool calls complete multi-step tasks.
+        text_fallback = False
         if not tool_calls and content and use_tools:
             tool_calls = _extract_text_tool_calls(content)
             if tool_calls:
+                text_fallback = True
+                _active_tools = False  # stop sending tools in payload — avoids Ollama hang
                 print(f'{D}  (parsed {len(tool_calls)} tool call(s) from response text){X}')
 
         if not tool_calls:
@@ -712,30 +724,45 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
                 messages.append({'role': 'assistant', 'content': content})
             return
 
-        messages.append({'role': 'assistant', 'content': content or '', 'tool_calls': [
-            {'id': tc['id'], 'type': 'function', 'function': tc['function']}
-            for tc in tool_calls
-        ]})
+        def _run_calls(calls):
+            results = []
+            for tc in calls:
+                name = tc['function']['name']
+                try:
+                    args = json.loads(tc['function']['arguments'] or '{}')
+                except Exception:
+                    args = {}
+                print()
+                allowed = ask_permission(name, args, skip)
+                if not allowed:
+                    result, is_error = 'User denied this tool call.', False
+                else:
+                    result, is_error = execute_tool(name, args, cwd)
+                    print_result(result, is_error)
+                results.append((tc, name, result))
+            return results
 
-        for tc in tool_calls:
-            name = tc['function']['name']
-            try:
-                args = json.loads(tc['function']['arguments'] or '{}')
-            except Exception:
-                args = {}
-            print()
-            allowed = ask_permission(name, args, skip)
-            if not allowed:
-                result, is_error = 'User denied this tool call.', False
-            else:
-                result, is_error = execute_tool(name, args, cwd)
-                print_result(result, is_error)
-            messages.append({
-                'role':         'tool',
-                'tool_call_id': tc['id'],
-                'name':         name,
-                'content':      result
-            })
+        if text_fallback:
+            # Model doesn't support structured tool use — don't add tool_calls
+            # to history (would cause 400s on later turns). Collect results
+            # and inject them as a plain user message instead.
+            messages.append({'role': 'assistant', 'content': content or ''})
+            parts = []
+            for tc, name, result in _run_calls(tool_calls):
+                parts.append(f'[{name} result]\n{result}')
+            messages.append({'role': 'user', 'content': '\n\n'.join(parts)})
+        else:
+            messages.append({'role': 'assistant', 'content': content or '', 'tool_calls': [
+                {'id': tc['id'], 'type': 'function', 'function': tc['function']}
+                for tc in tool_calls
+            ]})
+            for tc, name, result in _run_calls(tool_calls):
+                messages.append({
+                    'role':         'tool',
+                    'tool_call_id': tc['id'],
+                    'name':         name,
+                    'content':      result
+                })
 
     print(f'{Y}  Max steps reached.{X}')
 
