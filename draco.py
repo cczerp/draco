@@ -373,7 +373,8 @@ Rules:
 - For simple factual questions, answer directly without calling tools.
 - Chain multiple tool calls to complete tasks end-to-end.
 - For destructive actions (deleting files, etc.), briefly state what you're about to do before doing it.
-- Use shell commands appropriate for the user's OS."""
+- Use shell commands appropriate for the user's OS.
+- You have full internet access via the web_fetch tool. Use it to download files, read documentation, call APIs, or install packages. Never say you cannot access the internet."""
 
 TOOLS = [
     {
@@ -429,6 +430,24 @@ TOOLS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch a URL from the internet and return its content. Use for downloading files, reading web pages, calling APIs, or checking if a URL is reachable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url":     {"type": "string", "description": "The URL to fetch"},
+                    "method":  {"type": "string", "enum": ["GET", "POST"], "description": "HTTP method (default: GET)"},
+                    "headers": {"type": "object", "description": "Optional HTTP headers"},
+                    "body":    {"type": "string", "description": "Optional request body for POST"},
+                    "save_to": {"type": "string", "description": "Optional file path to save the response body to"}
+                },
+                "required": ["url"]
+            }
+        }
     }
 ]
 
@@ -437,6 +456,7 @@ TOOL_ICONS = {
     'read_file':      '📄',
     'write_file':     '✏️',
     'list_directory': '📁',
+    'web_fetch':      '🌐',
 }
 
 _KNOWN_TOOLS = {t['function']['name'] for t in TOOLS}
@@ -486,6 +506,28 @@ def execute_tool(name, args, cwd):
                 except PermissionError:
                     lines.append(f'🔒 {item.name}')
             return ('\n'.join(lines) if lines else '(empty)'), False
+
+        elif name == 'web_fetch':
+            url     = args.get('url', '')
+            method  = args.get('method', 'GET').upper()
+            headers = args.get('headers') or {}
+            body    = args.get('body')
+            save_to = args.get('save_to')
+            r = requests.request(method, url, headers=headers,
+                                 data=body.encode() if body else None,
+                                 timeout=30, allow_redirects=True)
+            if save_to:
+                path = _resolve(save_to, cwd)
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_bytes(r.content)
+                return f'Saved {len(r.content):,} bytes → {path}  (HTTP {r.status_code})', not r.ok
+            ct = r.headers.get('content-type', '')
+            if 'text' in ct or 'json' in ct or 'xml' in ct or 'javascript' in ct:
+                text = r.text
+                if len(text) > 8000:
+                    text = text[:8000] + f'\n… (truncated, {len(text):,} chars total)'
+                return f'HTTP {r.status_code}\n{text}', not r.ok
+            return f'HTTP {r.status_code}  ({len(r.content):,} bytes, {ct})  — use save_to to write binary content', not r.ok
 
         else:
             return f'Unknown tool: {name}', True
