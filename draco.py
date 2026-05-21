@@ -5,11 +5,13 @@ Usage: draco [--dangerously-skip-permissions] [--model MODEL] [prompt]
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import platform
@@ -59,6 +61,57 @@ _chat_url = OLLAMA_BASE.rstrip('/') + '/v1/chat/completions'
 _headers  = {}
 _backend  = 'ollama'
 _models   = []
+
+
+# ── Execution trace ───────────────────────────────────────────────────────────
+
+_trace_file: 'Path | None' = None
+
+def _init_trace():
+    global _trace_file
+    d = Path.home() / '.local' / 'share' / 'draco' / 'traces'
+    d.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    _trace_file = d / f'{ts}_{os.getpid()}.jsonl'
+
+def _trace(entry: dict):
+    if _trace_file is None:
+        return
+    entry.setdefault('ts', datetime.datetime.now().isoformat(timespec='milliseconds'))
+    with open(_trace_file, 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+def _show_last_trace():
+    d = Path.home() / '.local' / 'share' / 'draco' / 'traces'
+    if not d.exists() or not list(d.glob('*.jsonl')):
+        print(f'{D}  No traces yet.{X}')
+        return
+    latest = sorted(d.glob('*.jsonl'))[-1]
+    print(f'\n{D}  Trace: {latest.name}{X}\n')
+    with open(latest, encoding='utf-8') as fh:
+        for raw in fh:
+            try:
+                e = json.loads(raw)
+                ev  = e.get('event', '?')
+                ts  = e.get('ts', '')[-12:]
+                if ev == 'tool':
+                    icon    = TOOL_ICONS.get(e['tool'], '🔩')
+                    ms      = e.get('elapsed_ms', '?')
+                    err_tag = f' {R}error{X}' if e.get('error') else ''
+                    snippet = e.get('result_snippet', '')[:80].replace('\n', ' ')
+                    print(f'  {D}{ts}{X}  {P}{icon} {e["tool"]}{X}  {D}({ms}ms){X}{err_tag}')
+                    if snippet:
+                        print(f'         {D}⎿ {snippet}{X}')
+                elif ev == 'response':
+                    snippet = e.get('text', '')[:120].replace('\n', ' ')
+                    print(f'  {D}{ts}{X}  {G}✓{X}  {D}{snippet}{X}')
+                elif ev == 'skip_summary':
+                    print(f'  {D}{ts}{X}  {Y}→ skip_summary (single-step){X}')
+                elif ev == 'schema_error':
+                    print(f'  {D}{ts}{X}  {R}✗ schema: {e.get("error")}{X}')
+            except Exception:
+                pass
+    print()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -455,6 +508,35 @@ TOOL_ICONS = {
 
 _KNOWN_TOOLS = {t['function']['name'] for t in TOOLS}
 
+# ── Schema validation ─────────────────────────────────────────────────────────
+
+_TOOL_REQUIRED: dict = {
+    'run_command':    ['command'],
+    'read_file':      ['path'],
+    'write_file':     ['path', 'content'],
+    'list_directory': ['path'],
+    'web_fetch':      ['url'],
+}
+_TOOL_ALIASES: dict = {
+    'run_command':    {'cmd': 'command', 'shell_command': 'command', 'shell': 'command', 'bash': 'command'},
+    'read_file':      {'filename': 'path', 'file_path': 'path', 'filepath': 'path', 'file': 'path'},
+    'write_file':     {'filename': 'path', 'file_path': 'path', 'filepath': 'path', 'file': 'path'},
+    'list_directory': {'directory': 'path', 'dir': 'path', 'folder': 'path'},
+    'web_fetch':      {'link': 'url', 'uri': 'url', 'endpoint': 'url', 'address': 'url'},
+}
+
+def _validate_and_normalize(name: str, args: dict) -> 'tuple[dict, str | None]':
+    """Normalize argument aliases and check required parameters.
+    Returns (normalized_args, error_message | None)."""
+    if name not in _KNOWN_TOOLS:
+        return args, f'Unknown tool: {name!r}'
+    aliases = _TOOL_ALIASES.get(name, {})
+    norm = {aliases.get(k, k): v for k, v in args.items()}
+    missing = [r for r in _TOOL_REQUIRED.get(name, []) if r not in norm]
+    if missing:
+        return norm, f'Missing required param(s): {missing}'
+    return norm, None
+
 
 # ── Tool execution ────────────────────────────────────────────────────────────
 
@@ -771,6 +853,25 @@ def print_result(text, is_error):
 
 # Minimal system prompt used only for summary steps — avoids re-prefilling the
 # full rules prompt which roughly doubles TTFT on CPU inference.
+# ── Single-step heuristic ─────────────────────────────────────────────────────
+# Requests that start with an explicit single-tool prefix and contain no
+# continuation keywords can skip the summary LLM call — the tool output is
+# already shown and no follow-up action is implied.
+
+_SINGLE_STEP_RE = re.compile(
+    r'^(?:run:?\s+\S|read\s+[/~]|list\s+[/~]|ls\s+[/~]|fetch\s+https?://)',
+    re.IGNORECASE,
+)
+_CONTINUATION_RE = re.compile(
+    r'\b(?:then|after\s+that|and\s+(?:then\s+)?(?:write|save|store|put|send)|'
+    r'write\s+(?:it\s+)?to\b|save\s+(?:it\s+)?to\b|store\s+(?:it\s+)?in\b)\b',
+    re.IGNORECASE,
+)
+
+def _is_single_step_request(text: str) -> bool:
+    return bool(_SINGLE_STEP_RE.match(text.strip())) and not _CONTINUATION_RE.search(text)
+
+
 _SUMMARY_SYSTEM = (
     'You are Draco, an AI agent with full system access.\n'
     'RULES:\n'
@@ -845,14 +946,34 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
                 args = json.loads(tc['function']['arguments'] or '{}')
             except Exception:
                 args = {}
+
+            # Normalize aliases and validate required params before execution
+            args, schema_err = _validate_and_normalize(name, args)
+            if schema_err:
+                _trace({'event': 'schema_error', 'tool': name, 'error': schema_err,
+                        'raw_args': tc['function'].get('arguments', '')[:200]})
+
             print()
             allowed = ask_permission(name, args, skip)
             if not allowed:
                 result, is_error = 'User denied this tool call.', False
-            else:
-                result, is_error = execute_tool(name, args, cwd)
+            elif schema_err:
+                result, is_error = f'Schema error — {schema_err}', True
                 print_result(result, is_error)
-            results.append((tc, name, result))
+            else:
+                t0 = time.monotonic()
+                result, is_error = execute_tool(name, args, cwd)
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                print_result(result, is_error)
+                _trace({
+                    'event':          'tool',
+                    'tool':           name,
+                    'args':           {k: str(v)[:200] for k, v in args.items()},
+                    'elapsed_ms':     elapsed_ms,
+                    'result_snippet': (result or '')[:300],
+                    'error':          is_error,
+                })
+            results.append((tc, name, result, is_error))
         return results
 
     # After a text-fallback tool execution we inject results as a user message.
@@ -889,6 +1010,7 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
             # Final response — display it and record in history
             _print_response(content)
             if content:
+                _trace({'event': 'response', 'text': content[:300]})
                 messages.append({'role': 'assistant', 'content': content})
             return
 
@@ -905,7 +1027,7 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
             # (e.g., passing the real date output into write_file content).
             first_call = tool_calls[:1]
             results = _run_calls(first_call)
-            tc_done, name_done, result_done = results[0]
+            tc_done, name_done, result_done, is_error = results[0]
 
             # Build a natural-language assistant stub so history stays coherent
             # and the model doesn't echo back confusing placeholders.
@@ -922,6 +1044,14 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
             }
             action_stub = clean_content or _snippets.get(name_done, f'Calling {name_done}')
             messages.append({'role': 'assistant', 'content': action_stub})
+
+            # Skip the summary LLM call for simple single-step requests.
+            # The tool output is already shown; the extra call costs ~20–40s on CPU.
+            _orig_user = next((m['content'] for m in messages if m['role'] == 'user'), '')
+            _result_is_short = len(result_done.splitlines()) <= 5 and len(result_done) <= 300
+            if step == 0 and not is_error and _result_is_short and _is_single_step_request(_orig_user):
+                _trace({'event': 'skip_summary', 'reason': 'single_step'})
+                return
 
             # Cap result for injection — the user already saw the full output
             # via print_result; the model only needs enough context to decide
@@ -949,7 +1079,7 @@ def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
                 {'id': tc['id'], 'type': 'function', 'function': tc['function']}
                 for tc in tool_calls
             ]})
-            for tc, name, result in _run_calls(tool_calls):
+            for tc, name, result, _ie in _run_calls(tool_calls):
                 messages.append({
                     'role':         'tool',
                     'tool_call_id': tc['id'],
@@ -1034,6 +1164,7 @@ HELP_TEXT = f"""
   {B}/pull <model>{X}       download an Ollama model  (e.g. /pull llama3.2:3b)
   {B}/credentials{X}        set or update Nebius API key
   {B}/docker{X}             install / configure Docker step by step
+  {B}/trace{X}              show tool-call trace for the last session
   {B}/exit{X}               quit
   {B}Ctrl+C{X}              quit (or interrupt current response)
 """
@@ -1059,7 +1190,13 @@ examples:
                     help='Auto-approve all tool calls without prompting')
     ap.add_argument('--no-tools', action='store_true', help='Disable tool use')
     ap.add_argument('--models', action='store_true', help='List available models and exit')
+    ap.add_argument('--show-trace', action='store_true',
+                    help='Show the last session tool-call trace and exit')
     args = ap.parse_args()
+
+    if args.show_trace:
+        _show_last_trace()
+        sys.exit(0)
 
     if args.models:
         models = get_ollama_models()
@@ -1071,6 +1208,7 @@ examples:
             print(f'  {m}{marker}')
         sys.exit(0)
 
+    _init_trace()
     skip      = args.dangerously_skip_permissions
     use_tools = not args.no_tools
     cwd       = os.getcwd()
@@ -1098,7 +1236,7 @@ examples:
         'not_installed': f'{R}not installed{X}  {D}→ /docker to set up{X}',
     }
     print(f'{D}  Docker  : {X}{docker_labels.get(docker_status, docker_status)}')
-    print(f'{D}  /help  /models  /pull  /backend  /credentials  /docker  /exit{X}\n')
+    print(f'{D}  /help  /models  /pull  /backend  /credentials  /docker  /trace  /exit{X}\n')
 
     _os    = platform.system()
     _shell = 'PowerShell/cmd' if _os == 'Windows' else os.environ.get('SHELL', 'bash')
@@ -1173,6 +1311,9 @@ examples:
 
             elif cmd == '/docker':
                 run_docker_setup()
+
+            elif cmd == '/trace':
+                _show_last_trace()
 
             elif cmd == '/credentials':
                 key = prompt_nebius_credentials()
