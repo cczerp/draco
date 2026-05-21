@@ -359,22 +359,16 @@ def _model_size_hint(name: str) -> str:
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are Draco, a powerful AI agent running directly on the user's machine.
-Your name is Draco. You are not ChatGPT, not GPT-4, not Claude — you are Draco.
-You have full tool access: run any shell command, read/write any file, list directories.
-OS: {os}
-Shell: {shell}
-Current working directory: {cwd}
-Home directory: {home}
-Hostname: {hostname}
+You are Draco, an AI agent with full system access. OS: {os} | Shell: {shell} | CWD: {cwd} | Home: {home}
 
-Rules:
-- Be direct and action-oriented. When a task requires system access, use your tools immediately — don't describe what you would do, just do it.
-- For simple factual questions, answer directly without calling tools.
-- Chain multiple tool calls to complete tasks end-to-end.
-- For destructive actions (deleting files, etc.), briefly state what you're about to do before doing it.
-- Use shell commands appropriate for the user's OS.
-- You have full internet access via the web_fetch tool. Use it to download files, read documentation, call APIs, or install packages. Never say you cannot access the internet."""
+RULES (follow exactly):
+1. If the user explicitly asks you to DO something on the system (run, list, read, write, fetch), call the tool.
+   If the user asks HOW to do something, or asks a factual/conversational question, answer directly — no tool call.
+2. Call tools by outputting a JSON object: {{"name": "<tool>", "arguments": {{...}}}}
+3. One tool call per response. Wait for the result before calling the next tool.
+4. NEVER claim a tool is unavailable. Tools: run_command, read_file, write_file, list_directory, web_fetch.
+5. NEVER embed shell variables ($(date), $HOME) in write_file content — run_command first to get actual values.
+6. After tool results, give a short direct answer. Do NOT ask follow-up questions or offer further help."""
 
 TOOLS = [
     {
@@ -482,11 +476,11 @@ def execute_tool(name, args, cwd):
             return (combined.strip() or f'(exit {result.returncode})'), result.returncode != 0
 
         elif name == 'read_file':
-            path = _resolve(args.get('path', ''), cwd)
+            path = _resolve(args.get('path') or args.get('filename', ''), cwd)
             return Path(path).read_text(encoding='utf-8', errors='replace'), False
 
         elif name == 'write_file':
-            path    = _resolve(args.get('path', ''), cwd)
+            path    = _resolve(args.get('path') or args.get('filename', ''), cwd)
             content = args.get('content', '')
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_text(content, encoding='utf-8')
@@ -597,16 +591,59 @@ def _extract_text_tool_calls(content: str) -> list:
     return calls
 
 
+def _clean_tool_json_from_text(content: str) -> str:
+    """Remove JSON tool call blocks from response text, returning clean natural language."""
+    result = content
+
+    # Remove fenced code blocks containing tool calls
+    def _remove_if_tool_call(m):
+        block = m.group(1).strip()
+        try:
+            obj = json.loads(block)
+            if obj.get('name') in _KNOWN_TOOLS:
+                return ''
+        except Exception:
+            pass
+        return m.group(0)
+
+    result = re.sub(r'```(?:json|tool_call)?\s*([\s\S]*?)```', _remove_if_tool_call, result)
+
+    # Remove bare JSON tool call objects
+    dec = json.JSONDecoder()
+    parts = []
+    i = 0
+    last_end = 0
+    while i < len(result):
+        if result[i] == '{':
+            try:
+                obj, end = dec.raw_decode(result, i)
+                if obj.get('name') in _KNOWN_TOOLS:
+                    parts.append(result[last_end:i])
+                    last_end = end
+                    i = end
+                    continue
+            except json.JSONDecodeError:
+                pass
+        i += 1
+    parts.append(result[last_end:])
+    result = ''.join(parts)
+
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
+
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
-def call_llm(messages, model, use_tools):
-    """Call the active backend (always streaming). Returns (content: str, tool_calls: list)."""
+def call_llm(messages, model, use_tools, max_tokens=None):
+    """Call the active backend (buffered). Returns (content: str, tool_calls: list)."""
     payload = {
         'model':       model,
         'messages':    messages,
-        'temperature': 0.7,
+        'temperature': 0.3,
         'stream':      True,
     }
+    if max_tokens:
+        payload['max_tokens'] = max_tokens
     if use_tools:
         payload['tools']       = TOOLS
         payload['tool_choice'] = 'auto'
@@ -621,26 +658,31 @@ def call_llm(messages, model, use_tools):
         except Exception:
             return r.text[:300] or f'HTTP {r.status_code}'
 
+    sys.stdout.write(f'{D}  ···{X}')
+    sys.stdout.flush()
+
     try:
         resp = requests.post(
             _chat_url, headers=_headers,
             json=payload, stream=True, timeout=180
         )
         if not resp.ok:
+            sys.stdout.write('\r     \r')
             print(f'\n{R}  {_backend} error {resp.status_code}: {_extract_error(resp)}{X}\n')
             return None, []
     except requests.exceptions.ConnectionError:
+        sys.stdout.write('\r     \r')
         print(f'\n{R}Cannot connect to {_backend} backend.{X}')
         if _backend == 'ollama':
             print(f'{D}Check: systemctl status ollama{X}\n')
         return None, []
     except Exception as e:
+        sys.stdout.write('\r     \r')
         print(f'\n{R}Error: {e}{X}\n')
         return None, []
 
-    # ── Streaming path (handles both plain text and tool-call deltas) ─────────
+    # ── Buffer streaming response (plain text + structured tool-call deltas) ──
     content         = ''
-    printed_header  = False
     streaming_calls = {}   # index → {id, name, arguments}
 
     for raw in resp.iter_lines():
@@ -660,10 +702,6 @@ def call_llm(messages, model, use_tools):
 
         tok = delta.get('content') or ''
         if tok:
-            if not printed_header:
-                print(f'\n{P}{B}Draco:{X} ', end='', flush=True)
-                printed_header = True
-            print(tok, end='', flush=True)
             content += tok
 
         # Accumulate structured tool-call deltas (OpenAI streaming format)
@@ -680,8 +718,8 @@ def call_llm(messages, model, use_tools):
                 streaming_calls[idx]['name'] += fn['name']
             streaming_calls[idx]['arguments'] += fn.get('arguments', '')
 
-    if printed_header:
-        print('\n')
+    sys.stdout.write('\r     \r')
+    sys.stdout.flush()
 
     tool_calls = [
         {
@@ -701,7 +739,7 @@ def call_llm(messages, model, use_tools):
 
 def ask_permission(name, args, skip):
     icon    = TOOL_ICONS.get(name, '🔩')
-    preview = (args.get('command') or args.get('path') or json.dumps(args))[:100]
+    preview = (args.get('command') or args.get('path') or args.get('url') or json.dumps(args))[:100]
     print(f'{P}{B}{icon} {name}{X}{D}({preview}){X}')
     if skip:
         return True
@@ -731,69 +769,182 @@ def print_result(text, is_error):
 
 # ── One conversation turn ─────────────────────────────────────────────────────
 
+# Minimal system prompt used only for summary steps — avoids re-prefilling the
+# full rules prompt which roughly doubles TTFT on CPU inference.
+_SUMMARY_SYSTEM = (
+    'You are Draco, an AI agent with full system access.\n'
+    'RULES:\n'
+    '1. If the user asked you to DO something and it is not yet done, call the next tool.\n'
+    '2. Call tools by outputting a JSON object: {"name": "<tool>", "arguments": {...}}\n'
+    '3. One tool call per response.\n'
+    '4. Tools: run_command, read_file, write_file, list_directory, web_fetch.\n'
+    '5. If the task is fully complete, give a short plain-English answer. Do NOT offer further help.'
+)
+
+_VERBOSE_TRAILING_RE = re.compile(
+    r'[\s.!]*\s*(?:'
+    r'[Hh]ow can I (?:assist|help)\b.*?[?!.]?'
+    r'|[Ii]s there anything (?:else|more)\b.*?[?!.]?'
+    r'|[Ff]eel free to\b.*?[.!]?'
+    r"|[Dd]on't hesitate to\b.*?[.!]?"
+    r'|[Ll]et me know if\b.*?[.!]?'
+    r'|[Ii]f you need\b.*?[.!]?'
+    r'|[Pp]lease let me know\b.*?[.!]?'
+    r'|[Hh]ope this helps\b.*?[.!]?'
+    r'|[Rr]each out if\b.*?[.!]?'
+    r'|[Ww]hat else can I\b.*?[?!.]?'
+    r'|[Ii]s there something\b.*?[?!.]?'
+    r')$',
+    re.DOTALL,
+)
+
+def _strip_verbose_ending(content: str) -> str:
+    """Strip trailing 'how can I help?' sentences from the end of responses."""
+    result = _VERBOSE_TRAILING_RE.sub('', content).strip()
+    # Also strip any whole trailing lines that are entirely verbose phrases
+    lines = result.splitlines()
+    while lines:
+        last = lines[-1].strip().lower()
+        if any(last.startswith(p) for p in (
+            'if you need', 'is there anything', 'feel free to', 'let me know',
+            "don't hesitate", 'reach out if', 'how can i', 'what else can i',
+            'is there something', 'hope this helps', 'happy to help',
+        )):
+            lines.pop()
+        else:
+            break
+    return '\n'.join(lines).strip()
+
+
+def _print_response(content: str):
+    """Print assistant response with Draco header.
+
+    Always strips JSON tool calls from display — they are either handled by the
+    tool executor (text-fallback) or should not appear in final responses.
+    """
+    if not content:
+        return
+    text = _clean_tool_json_from_text(content.strip())
+    text = _strip_verbose_ending(text)
+    if text:
+        print(f'\n{P}{B}Draco:{X} {text}\n')
+
+
 def run_turn(messages, model, use_tools, skip, cwd, max_steps=20):
-    # _active_tools may be turned off mid-turn if the model doesn't support
-    # structured tool use (text fallback detected).
+    # _active_tools tracks whether to send tool schemas in the API payload.
+    # Disabled after text-fallback detection to avoid Ollama hangs, but
+    # _extract_text_tool_calls still runs every step (using use_tools) so
+    # models that always emit JSON tool calls can still complete multi-step tasks.
     _active_tools = use_tools
+
+    def _run_calls(calls):
+        results = []
+        for tc in calls:
+            name = tc['function']['name']
+            try:
+                args = json.loads(tc['function']['arguments'] or '{}')
+            except Exception:
+                args = {}
+            print()
+            allowed = ask_permission(name, args, skip)
+            if not allowed:
+                result, is_error = 'User denied this tool call.', False
+            else:
+                result, is_error = execute_tool(name, args, cwd)
+                print_result(result, is_error)
+            results.append((tc, name, result))
+        return results
+
+    # After a text-fallback tool execution we inject results as a user message.
+    # The next LLM call only needs to produce a short summary, so cap tokens.
+    _summary_step = False
+
     for step in range(max_steps):
-        if step > 0:
-            sys.stdout.write(f'{D}  thinking…{X}')
-            sys.stdout.flush()
-
-        content, tool_calls = call_llm(messages, model, _active_tools)
-
-        if step > 0:
-            sys.stdout.write('\r' + ' ' * 20 + '\r')
-            sys.stdout.flush()
+        max_tok = 64 if _summary_step else None
+        if _summary_step:
+            # Build a slim context: minimal system prompt + original user request +
+            # recent action/result. This halves prefill time vs. the full system prompt.
+            _user_start = next((i for i, m in enumerate(messages) if m['role'] == 'user'), 1)
+            _slim = [{'role': 'system', 'content': _SUMMARY_SYSTEM}, messages[_user_start]]
+            _slim.extend(messages[_user_start + 1:])
+            _call_msgs = _slim
+        else:
+            _call_msgs = messages
+        content, tool_calls = call_llm(_call_msgs, model, _active_tools, max_tokens=max_tok)
+        _summary_step = False  # reset each step
 
         if content is None:
             return
 
-        # Fallback: if the model printed tool calls as JSON text instead of
-        # using the structured API, parse and execute them. Keep checking on
-        # every step (use the original use_tools flag, not _active_tools) so
-        # models that always output JSON tool calls complete multi-step tasks.
+        # Text-fallback: model emitted JSON tool calls inside its text response
+        # instead of using the structured tool-call API.
         text_fallback = False
         if not tool_calls and content and use_tools:
             tool_calls = _extract_text_tool_calls(content)
             if tool_calls:
                 text_fallback = True
                 _active_tools = False  # stop sending tools in payload — avoids Ollama hang
-                print(f'{D}  (parsed {len(tool_calls)} tool call(s) from response text){X}')
 
         if not tool_calls:
+            # Final response — display it and record in history
+            _print_response(content)
             if content:
                 messages.append({'role': 'assistant', 'content': content})
             return
 
-        def _run_calls(calls):
-            results = []
-            for tc in calls:
-                name = tc['function']['name']
-                try:
-                    args = json.loads(tc['function']['arguments'] or '{}')
-                except Exception:
-                    args = {}
-                print()
-                allowed = ask_permission(name, args, skip)
-                if not allowed:
-                    result, is_error = 'User denied this tool call.', False
-                else:
-                    result, is_error = execute_tool(name, args, cwd)
-                    print_result(result, is_error)
-                results.append((tc, name, result))
-            return results
-
         if text_fallback:
-            # Model doesn't support structured tool use — don't add tool_calls
-            # to history (would cause 400s on later turns). Collect results
-            # and inject them as a plain user message instead.
-            messages.append({'role': 'assistant', 'content': content or ''})
-            parts = []
-            for tc, name, result in _run_calls(tool_calls):
-                parts.append(f'[{name} result]\n{result}')
-            messages.append({'role': 'user', 'content': '\n\n'.join(parts)})
+            # Show any natural-language preamble, strip the JSON tool call portion
+            _print_response(content)
+            clean_content = _clean_tool_json_from_text(content)
+            # Store only the clean content so JSON doesn't pollute future context.
+            # Use a placeholder if the cleaned content is empty so the assistant
+            # turn is never blank (some backends reject empty assistant messages).
+            # Execute only the FIRST detected tool call, then loop back.
+            # This matches Claude's one-call-per-turn design and allows the model
+            # to see actual results before generating the next dependent call
+            # (e.g., passing the real date output into write_file content).
+            first_call = tool_calls[:1]
+            results = _run_calls(first_call)
+            tc_done, name_done, result_done = results[0]
+
+            # Build a natural-language assistant stub so history stays coherent
+            # and the model doesn't echo back confusing placeholders.
+            try:
+                _fa = json.loads(tc_done['function'].get('arguments') or '{}')
+            except Exception:
+                _fa = {}
+            _snippets = {
+                'run_command':    f"Running: {_fa.get('command', '')}",
+                'read_file':      f"Reading: {_fa.get('path', '')}",
+                'write_file':     f"Writing to: {_fa.get('path', '')}",
+                'list_directory': f"Listing: {_fa.get('path', '')}",
+                'web_fetch':      f"Fetching: {_fa.get('url', '')}",
+            }
+            action_stub = clean_content or _snippets.get(name_done, f'Calling {name_done}')
+            messages.append({'role': 'assistant', 'content': action_stub})
+
+            # Cap result for injection — the user already saw the full output
+            # via print_result; the model only needs enough context to decide
+            # next steps. Large injections cause severe TTFT slowdown on CPU.
+            lines = result_done.splitlines()
+            if len(lines) > 15 or len(result_done) > 350:
+                snippet = '\n'.join(lines[:15])[:350]
+                r_inject = snippet + f'\n… ({len(lines)} lines total)'
+            else:
+                r_inject = result_done
+
+            messages.append({
+                'role': 'user',
+                'content': (
+                    f'[{name_done} result]\n{r_inject}\n\n'
+                    'If the task is complete, give your final answer in plain English. '
+                    'If more steps are needed, output the next JSON tool call.'
+                ),
+            })
+            _summary_step = True  # next call only needs a short summary
         else:
+            # Structured tool calls via API — display any preamble text
+            _print_response(content)
             messages.append({'role': 'assistant', 'content': content or '', 'tool_calls': [
                 {'id': tc['id'], 'type': 'function', 'function': tc['function']}
                 for tc in tool_calls
